@@ -1,22 +1,22 @@
-#!/bin/sh
+#!/bin/bash
 # by Jochen Demmer
-# Version 2.0 9th April 2015
+# Version 2.1 10th April 2015
 # KLvmsnapshot
+# requires python 2.x
 
 ####
 #### functions
 ####
 
+isrunning=FALSE
 red='\033[0;31m'
 nocolor='\033[0m'
 tellhow() {
-	echo "usage: $0 <HOSTNAME> <LVMVG> <LVMPARTNAME> <LVMSSSIZE> <GUESTNAME>"
-	echo "${red}All arguments are mandatory.${nocolor}"
-	echo "HOSTNAME:\tThis corresponds to the name of the KVM guest in a short form, like srv003."
-	echo "LVMVG:\t\tThis is the volume group where the logical volume belongs to, e.g. vg0."
-	echo "LVMPARTNAME:\tThis is the name of the logical volume that needs to be saved, e.g. srv003_boot."
-	echo "LVMSIZE:\tHow big the snapshot volume should be. Please choose reasonable size or backup may not work."
-	echo "GUESTNAME:\tThis is the actual name of the kvm guest, e.g. srv003.my.domain."
+	echo -e "usage: $0 <LVMVG> <LVMPARTNAME> <GUESTNAME>"
+	echo -e "${red}All parameters are mandatory.${nocolor}"
+	echo -e "LVMVG:\t\tThis is the volume group where the logical volume belongs to, e.g. vg0."
+	echo -e "LVMPARTNAME:\tThis is the name of the logical volume that needs to be saved, e.g. srv003_boot."
+	echo -e "GUESTNAME:\tThis is the actual name of the kvm guest, e.g. srv003.my.domain."
 }
 
 
@@ -28,53 +28,92 @@ LVMSSPREFIX="snapsh_"		# prefix for snapshot volumes
 VIRSHPATH="/usr/bin"		# path to where the virsh command is located
 LVPATH="/sbin"			# path to where the lv commands are located
 LOGTAG="dosnapshot"		# the tag that appears in syslog
+SSPERCENT=0.20
 
 ####
 #### no modifications down here
 ####
 
 # Variables that are handed over
-HOSTNAME=$1			# hostname e.g. srv003
-LVMVG=$2			# VG name e.g. vg0
-LVMPARTNAME=$3			# source partition name e.g. srv002_boot v srv007
-LVMSSSIZE=$4			# Snapshot volume size e.g. 10G v 500M
-GUESTNAME=$5			# name of the virt guest to give it virsh commands 
-
-# assembled variables
-LVMVOLDEV=/dev/$LVMVG/$LVMPARTNAME			# dev path of logical volume to backup
-LVMSSDEV=/dev/$LVMVG/$LVMSSPREFIX$LVMPARTNAME		# dev path of logical volume snapshot device
-LVMSSNAME=$LVMSSPREFIX$LVMPARTNAME			# name of the snapshot volume
+LVMVG=$1			# VG name e.g. vg0
+LVMPARTNAME=$2			# source partition name e.g. srv002_boot v srv007
+GUESTNAME=$3			# name of the virt guest to give it virsh commands 
 
 # beginning
-if [ "$#" -ne 5 ]; then
-	echo "${red}Illegal number of parameters.${nocolor}"
+if [ "$#" -ne 3 ]; then
+	echo -e "${red}Illegal number of parameters.${nocolor}"
 	logger -t $LOGTAG Script failed, because of illegal number of parameters.
 	logger -t $LOGTAG Hostname: $Hostname LVM partition: $LVMPARTNAME KVM guest: $GUESTNAME
 	tellhow
 	exit 1
 fi
 
+if ! $LVPATH/vgdisplay $LVMVG; then
+	logger -s -t $LOGTAG There is no such volume group as $LVMVG. Stopping
+	exit 5
+fi
+
+LVMVOLDEV=/dev/$LVMVG/$LVMPARTNAME			# dev path of logical volume to backup
+if ! $LVPATH/lvdisplay $LVMVOLDEV; then
+	logger -s -t $LOGTAG There is no such logical volume as $LVMVOLDEV. Stopping
+	exit 4
+fi
+
+if ! virsh list --all |grep -q -i $GUESTNAME; then
+	logger -s -t $LOGTAG There is no such guest as $GUESTNAME. Stopping.
+	exit 3
+fi
+
+LVMSIZET=$(lvdisplay /dev/$LVMVG/$LVMPARTNAME |grep Size | awk {'print $3'})
+LVMSSSIZE=`python -c "print int($LVMSIZET * 1000 * $SSPERCENT)"`
+if ! [[ $LVMSSSIZE =~ ^-?[0-9]+$ ]]; then
+	echo "Please give a number as snapshot size."
+	tellhow
+	exit 2
+fi
+
 logger -t $LOGTAG "script begins"
 logger -t $LOGTAG "backup volume $LVMVOLDEV virtual machine $GUESTNAME"
 
-# remove yesterday's snapshot
+# assembled variables
+LVMSSDEV=/dev/$LVMVG/$LVMSSPREFIX$LVMPARTNAME		# dev path of logical volume snapshot device
+LVMSSNAME=$LVMSSPREFIX$LVMPARTNAME			# name of the snapshot volume
+
+echo -e "Snapshoting summary:"
+echo -e "Guest:\t\t${red}$GUESTNAME${nocolor}"
+echo -e "LVM Partition:\t${red}$LVMPARTNAME${nocolor}"
+echo -e "Partition size:\t${red}$LVMSIZET GB${nocolor}"
+echo -e "Snapshot size:\t${red}$LVMSSSIZE MB${nocolor}"
 
 if [ -b $LVMVOLDEV ]; then
 	if [ -b $LVMSSDEV ]; then
+		echo -e "removing old snapshot volume $LVMSSDEV"
 		logger -t $LOGTAG `$LVPATH/lvremove -f $LVMSSDEV`
 	else
 		logger -t $LOGTAG there was no logical snapshot volume at $LVMSSDEV to remove
 	fi
 	# suspend kvm guest
-	logger -t $LOGTAG `$VIRSHPATH/virsh suspend $GUESTNAME`
+	if virsh list --all | grep -i $GUESTNAME | grep -q -i 'running'; then
+		echo -e "suspending guest"
+		logger -t $LOGTAG `$VIRSHPATH/virsh suspend $GUESTNAME`
+		isrunning=TRUE
+	else
+		logger -t $LOGTAG "Guest $GUESTNAME isn't running so no suspending."
+	fi
 	# create today's snapshot
+	echo -e "creating snapshot"
+	echo "$LVPATH/lvcreate --size $LVMSSSIZE -s -n $LVMSSNAME $LVMVOLDEV"
 	logger -t $LOGTAG `$LVPATH/lvcreate --size $LVMSSSIZE -s -n $LVMSSNAME $LVMVOLDEV`
 	# unpause kvm guest
-	logger -t $LOGTAG `$VIRSHPATH/virsh resume $GUESTNAME`
+	if [ $isrunning = 'TRUE' ]; then
+		echo -e "resuming guest"
+		logger -t $LOGTAG `$VIRSHPATH/virsh resume $GUESTNAME`
+	fi
 else
 	logger -t $LOGTAG $LVMVOLDEV does not exist, no action.
 	exit 1
 fi
 #finishing
+echo "done"
 logger -t $LOGTAG "script end"
 exit 0
